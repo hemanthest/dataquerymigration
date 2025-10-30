@@ -1,0 +1,24 @@
+
+server:
+  port: 8080
+
+spring:
+  application:
+    name: sql-query-migrator
+  servlet:
+    multipart:
+      max-file-size: 50MB
+      max-request-size: 50MB
+      enabled: true
+
+logging:
+  level:
+    com.querymanager: DEBUG
+    root: INFO
+  pattern:
+    console: "%d{yyyy-MM-dd HH:mm:ss} - %msg%n"
+
+query-migrator:
+  temp-directory: ${java.io.tmpdir}/query-migrator
+
+

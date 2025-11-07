@@ -21,4 +21,14 @@ logging:
 query-migrator:
   temp-directory: ${java.io.tmpdir}/query-migrator
 
+# Zuora Configuration for Playwright Automation
+zuora:
+  loginUrl: https://one.zuora.com/one-id/login
+  username: ${ZUORA_USERNAME:abhijith.rao+sbx@estuate.com}
+  password: ${ZUORA_PASSWORD:Estuate@2025}
+  tenantId: SBX
+  dataQueryUrl: https://apisandbox.zuora.com/platform/apps/data-query/saved-queries
+  outputPath: reports/zuora/queries_extract.xlsx
+  inputPath: reports/zuora/queries_to_update.xlsx
+
 

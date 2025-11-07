@@ -12,5 +12,8 @@ public class QueryDTO {
     private String description;
     private String originalQuery;
     private String updatedQuery;
-    private boolean isImpacted;
+    private boolean impacted;
+    private String oldUrl;
+    private String newUrl;
+    private String status;
 }

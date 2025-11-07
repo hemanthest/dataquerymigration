@@ -1,9 +1,12 @@
 package com.querymanager.service;
 
 import com.querymanager.dto.MappingEntry;
+import com.querymanager.dto.MigrationResponse;
 import com.querymanager.dto.QueryDTO;
+import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import net.sf.jsqlparser.JSQLParserException;
+import org.springframework.web.multipart.MultipartFile;
 import net.sf.jsqlparser.parser.CCJSqlParserUtil;
 import net.sf.jsqlparser.statement.Statement;
 import net.sf.jsqlparser.statement.select.*;
@@ -19,7 +22,33 @@ import java.util.stream.Collectors;
 
 @Service
 @Slf4j
+@RequiredArgsConstructor
 public class SqlMigrationService {
+    private final ExcelService excelService;
+
+    public MigrationResponse migrateQueries(MultipartFile queryFile, MultipartFile mappingFile) {
+        try {
+            ExcelService.FileUploadResult result = excelService.readFiles(queryFile, mappingFile);
+            List<QueryDTO> impactedQueries = migrateQueries(result.getQueries(), result.getMappings());
+            
+            String reportPath = excelService.saveImpactedReport(impactedQueries);
+            
+            return MigrationResponse.builder()
+                .success(true)
+                .message("Successfully migrated queries")
+                .totalQueries(result.getQueries().size())
+                .impactedQueries(impactedQueries.size())
+                .reportFilePath(reportPath)
+                .build();
+                
+        } catch (Exception e) {
+            log.error("Error during query migration", e);
+            return MigrationResponse.builder()
+                .success(false)
+                .error(e.getMessage())
+                .build();
+        }
+    }
 
     /**
      * Result of query migration containing the migrated query and whether changes were made
@@ -50,6 +79,14 @@ public class SqlMigrationService {
         List<QueryDTO> impactedQueries = new ArrayList<>();
 
         for (QueryDTO query : queries) {
+            // If query already has an updatedQuery, mark it as impacted and add it to list
+            if (query.getUpdatedQuery() != null && !query.getUpdatedQuery().trim().isEmpty()) {
+                query.setImpacted(true);
+                impactedQueries.add(query);
+                log.debug("Query '{}' already has update", query.getQueryName());
+                continue;
+            }
+
             try {
                 MigrationResult result = migrateQuery(query.getOriginalQuery(), fieldMappings, tableMappings);
 
@@ -273,6 +310,7 @@ public class SqlMigrationService {
         Map<String, String> actualAliasToTable = new HashMap<>();
         Map<String, String> oldAliasToNewAlias = new HashMap<>();
         Map<String, String> newAliasToNewTable = new HashMap<>();
+        Set<String> onClauseColumns = new HashSet<>();  // Track ON clause columns (should stay with primary table)
         
         // Debug: Log sourceToTargetTables
         log.debug("sourceToTargetTables: {}", sourceToTargetTables);
@@ -364,6 +402,34 @@ public class SqlMigrationService {
             result = result.replaceAll(fromJoinPatternNoAlias, "$1 " + primaryTarget);
             
             log.debug("After basic replacement, query snippet: {}", result.substring(0, Math.min(300, result.length())));
+            
+            // CRITICAL FIX: For multi-target scenarios, protect ON clause columns from being routed to secondary tables
+            // Extract ON clause columns that reference the old alias - these should always use the primary table alias
+            if (targetTables.size() > 1) {
+                // Find ON clauses that follow the JOIN we just replaced
+                // Pattern: JOIN PrimaryTable primaryAlias ON ... oldAlias.column ...
+                Pattern onClausePattern = Pattern.compile(
+                    "(?i)JOIN\\s+" + Pattern.quote(primaryTarget) + "\\s+" + Pattern.quote(primaryAlias) + 
+                    "\\s+ON\\s+.*?(?=JOIN|WHERE|$)",
+                    Pattern.CASE_INSENSITIVE | Pattern.DOTALL
+                );
+                java.util.regex.Matcher onMatcher = onClausePattern.matcher(result);
+                if (onMatcher.find()) {
+                    String onClause = onMatcher.group(0);
+                    log.debug("Found ON clause for primary JOIN: {}", onClause.substring(0, Math.min(100, onClause.length())));
+                    
+                    // Extract any oldAlias.column references in this ON clause
+                    for (String oldAlias : actualAliasToTable.keySet()) {
+                        Pattern colPattern = Pattern.compile("\\b" + Pattern.quote(oldAlias) + "\\.([a-zA-Z_][a-zA-Z0-9_]*)\\b");
+                        java.util.regex.Matcher colMatcher = colPattern.matcher(onClause);
+                        while (colMatcher.find()) {
+                            String columnName = colMatcher.group(1);
+                            onClauseColumns.add(columnName.toLowerCase());
+                            log.debug("Protected ON clause column: {}", columnName);
+                        }
+                    }
+                }
+            }
             
             // Add JOIN clauses for additional target tables (insert before WHERE clause)
             if (targetTables.size() > 1) {
@@ -485,6 +551,20 @@ public class SqlMigrationService {
                 String newTable = newParts[0];
                 String newColumn = newParts[1];
                 
+                // CRITICAL: For multi-target scenarios, ON clause columns should ONLY route to primary table
+                // Check if this is an ON clause column and if we're trying to route it to a secondary table
+                List<String> tableMappings = sourceToTargetTables.get(oldTable.toLowerCase());
+                boolean hasMultipleTargets = tableMappings != null && tableMappings.size() > 1;
+                boolean isPrimaryTable = tableMappings != null && newTable.equals(tableMappings.get(0));
+                boolean isSecondaryTable = hasMultipleTargets && !isPrimaryTable;
+                boolean isOnClauseColumn = onClauseColumns.contains(oldColumn.toLowerCase());
+                
+                if (isSecondaryTable && isOnClauseColumn) {
+                    log.debug("Skipping ON clause column {}.{} from routing to secondary table {} (will be routed to primary table only)", 
+                        oldTable, oldColumn, newTable);
+                    continue; // Skip secondary table routing, primary table routing will handle it
+                }
+                
                 // Get the correct alias for this specific target table
                 String newAlias = targetTableAliases.get(newTable);
                 if (newAlias == null) {
@@ -548,6 +628,71 @@ public class SqlMigrationService {
                     result = result.replaceAll(newAliasOldColumnPattern, newAlias + "." + newColumn);
                     if (!beforeReplace.equals(result)) {
                         log.debug("Replaced {}.{} -> {}.{} (column name change after Step 2.5)", newAlias, oldColumn, newAlias, newColumn);
+                    }
+                }
+            }
+        }
+        
+        // Step 3.5: Force ON clause columns to use primary table alias (for multi-target scenarios)
+        // This handles cases where ON clause columns weren't properly routed in Step 3
+        // (e.g., when Excel only has secondary table mapping but ON clause needs primary table)
+        if (!onClauseColumns.isEmpty()) {
+            log.debug("=== STEP 3.5 START: Force ON Clause Columns to Primary Table ===");
+            
+            for (Map.Entry<String, List<String>> entry : sourceToTargetTables.entrySet()) {
+                String sourceTable = entry.getKey();
+                List<String> targetTables = entry.getValue();
+                
+                if (targetTables.size() > 1) {
+                    String primaryTable = targetTables.get(0);
+                    String primaryAlias = targetTableAliases.get(primaryTable);
+                    
+                    // Find the old alias for this source table
+                    for (Map.Entry<String, String> aliasEntry : actualAliasToTable.entrySet()) {
+                        String oldAlias = aliasEntry.getKey();
+                        String aliasSourceTable = aliasEntry.getValue();
+                        
+                        if (aliasSourceTable != null && aliasSourceTable.equalsIgnoreCase(sourceTable)) {
+                            // For each ON clause column, force it to use primary alias
+                            for (String onClauseColumn : onClauseColumns) {
+                                // Create case-insensitive pattern for the column
+                                String columnPattern = onClauseColumn.chars()
+                                    .mapToObj(c -> {
+                                        char ch = (char) c;
+                                        if (Character.isLetter(ch)) {
+                                            return "[" + Character.toLowerCase(ch) + Character.toUpperCase(ch) + "]";
+                                        } else {
+                                            return Pattern.quote(String.valueOf(ch));
+                                        }
+                                    })
+                                    .collect(java.util.stream.Collectors.joining());
+                                
+                                String oldAliasColumnPattern = "\\b" + Pattern.quote(oldAlias) + "\\." + columnPattern + "\\b";
+                                String beforeReplace = result;
+                                
+                                // Find the column name from mappings (preserve target casing)
+                                String targetColumnName = onClauseColumn; // default
+                                for (Map.Entry<String, String> colEntry : columnReplacements.entrySet()) {
+                                    String key = colEntry.getKey();
+                                    String value = colEntry.getValue();
+                                    if (key.contains(".") && value.contains(".")) {
+                                        String[] keyParts = key.split("\\.", 2);
+                                        String[] valueParts = value.split("\\.", 2);
+                                        if (keyParts.length == 2 && valueParts.length == 2 &&
+                                            keyParts[0].equalsIgnoreCase(sourceTable) &&
+                                            keyParts[1].equalsIgnoreCase(onClauseColumn)) {
+                                            targetColumnName = valueParts[1]; // Use target column name
+                                            break;
+                                        }
+                                    }
+                                }
+                                
+                                result = result.replaceAll(oldAliasColumnPattern, primaryAlias + "." + targetColumnName);
+                                if (!beforeReplace.equals(result)) {
+                                    log.debug("Forced ON clause column {}.{} -> {}.{}", oldAlias, onClauseColumn, primaryAlias, targetColumnName);
+                                }
+                            }
+                        }
                     }
                 }
             }

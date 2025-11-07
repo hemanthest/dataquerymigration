@@ -4,6 +4,7 @@ import com.querymanager.dto.MappingEntry;
 import com.querymanager.dto.QueryDTO;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.poi.ss.usermodel.*;
+import org.apache.poi.ss.usermodel.DateUtil;
 import org.apache.poi.xssf.usermodel.XSSFWorkbook;
 import org.springframework.stereotype.Service;
 import org.springframework.web.multipart.MultipartFile;
@@ -21,6 +22,30 @@ import java.util.List;
 @Service
 @Slf4j
 public class ExcelService {
+
+    public static class FileUploadResult {
+        private final List<QueryDTO> queries;
+        private final List<MappingEntry> mappings;
+        
+        public FileUploadResult(List<QueryDTO> queries, List<MappingEntry> mappings) {
+            this.queries = queries;
+            this.mappings = mappings;
+        }
+        
+        public List<QueryDTO> getQueries() {
+            return queries;
+        }
+        
+        public List<MappingEntry> getMappings() {
+            return mappings;
+        }
+    }
+
+    public FileUploadResult readFiles(MultipartFile queryFile, MultipartFile mappingFile) throws IOException {
+        List<QueryDTO> queries = readQueryFile(queryFile);
+        List<MappingEntry> mappings = readMappingFile(mappingFile);
+        return new FileUploadResult(queries, mappings);
+    }
 
     private static final String REPORTS_DIR = "reports";
 
@@ -50,10 +75,16 @@ public class ExcelService {
                 Row row = sheet.getRow(i);
                 if (row == null) continue;
 
+                String queryName = getCellValueAsString(row.getCell(0));
+                if (queryName == null || queryName.trim().isEmpty()) {
+                    continue; // Skip rows without a query name
+                }
+
                 QueryDTO query = new QueryDTO();
-                query.setQueryName(getCellValueAsString(row.getCell(0)));
+                query.setQueryName(queryName);
                 query.setDescription(getCellValueAsString(row.getCell(1)));
                 query.setOriginalQuery(getCellValueAsString(row.getCell(2)));
+                query.setUpdatedQuery(getCellValueAsString(row.getCell(3)));  // Read updated query
                 query.setImpacted(false);
 
                 queries.add(query);
@@ -125,8 +156,6 @@ public class ExcelService {
         try (Workbook workbook = new XSSFWorkbook();
              ByteArrayOutputStream out = new ByteArrayOutputStream()) {
 
-            Sheet sheet = workbook.createSheet("Impacted Queries");
-
             // Create header style
             CellStyle headerStyle = workbook.createCellStyle();
             Font headerFont = workbook.createFont();
@@ -135,33 +164,73 @@ public class ExcelService {
             headerStyle.setFillForegroundColor(IndexedColors.GREY_25_PERCENT.getIndex());
             headerStyle.setFillPattern(FillPatternType.SOLID_FOREGROUND);
 
-            // Create header row
-            Row headerRow = sheet.createRow(0);
-            String[] headers = {"Query Name", "Query Description", "Actual Query", "Updated Query"};
-            for (int i = 0; i < headers.length; i++) {
-                Cell cell = headerRow.createCell(i);
-                cell.setCellValue(headers[i]);
-                cell.setCellStyle(headerStyle);
-            }
+            // Sheet 1: Query List
+            Sheet queryListSheet = workbook.createSheet("Query List");
+            String[] queryListHeaders = {"Query Name", "Query Description", "Original Query"};
+            createSheetWithData(queryListSheet, headerStyle, queryListHeaders, impactedQueries, 
+                (row, query, rowNum) -> {
+                    row.createCell(0).setCellValue(query.getQueryName());
+                    row.createCell(1).setCellValue(query.getDescription());
+                    row.createCell(2).setCellValue(query.getOriginalQuery());
+                });
 
-            // Add data rows
-            int rowNum = 1;
-            for (QueryDTO query : impactedQueries) {
-                Row row = sheet.createRow(rowNum++);
-                row.createCell(0).setCellValue(query.getQueryName());
-                row.createCell(1).setCellValue(query.getDescription());
-                row.createCell(2).setCellValue(query.getOriginalQuery());
-                row.createCell(3).setCellValue(query.getUpdatedQuery());
-            }
+            // Sheet 2: Migration Results
+            Sheet migrationSheet = workbook.createSheet("Migration Results");
+            String[] migrationHeaders = {"Query Name", "Query Description", "Original Query", "Updated Query"};
+            createSheetWithData(migrationSheet, headerStyle, migrationHeaders, impactedQueries,
+                (row, query, rowNum) -> {
+                    row.createCell(0).setCellValue(query.getQueryName());
+                    row.createCell(1).setCellValue(query.getDescription());
+                    row.createCell(2).setCellValue(query.getOriginalQuery());
+                    row.createCell(3).setCellValue(query.getUpdatedQuery());
+                });
 
-            // Auto-size columns
-            for (int i = 0; i < headers.length; i++) {
-                sheet.autoSizeColumn(i);
-            }
+            // Sheet 3: Zuora Update Results
+            Sheet zuoraSheet = workbook.createSheet("Zuora Update Results");
+            String[] zuoraHeaders = {"Query Name", "Query Description", "Original Query", "Updated Query", "Old URL", "New URL", "Status"};
+            createSheetWithData(zuoraSheet, headerStyle, zuoraHeaders, impactedQueries,
+                (row, query, rowNum) -> {
+                    row.createCell(0).setCellValue(query.getQueryName());
+                    row.createCell(1).setCellValue(query.getDescription());
+                    row.createCell(2).setCellValue(query.getOriginalQuery());
+                    row.createCell(3).setCellValue(query.getUpdatedQuery());
+                    row.createCell(4).setCellValue(query.getOldUrl() != null ? query.getOldUrl() : "");
+                    row.createCell(5).setCellValue(query.getNewUrl() != null ? query.getNewUrl() : "");
+                    row.createCell(6).setCellValue(query.getStatus() != null ? query.getStatus() : "");
+                });
 
             workbook.write(out);
-            log.info("Generated report with {} impacted queries", impactedQueries.size());
+            log.info("Generated report with {} queries across 3 sheets", impactedQueries.size());
             return out.toByteArray();
+        }
+    }
+
+    @FunctionalInterface
+    private interface RowWriter {
+        void writeRow(Row row, QueryDTO query, int rowNum);
+    }
+
+    private void createSheetWithData(Sheet sheet, CellStyle headerStyle, String[] headers,
+                                   List<QueryDTO> queries, RowWriter rowWriter) {
+        // Create header row
+        Row headerRow = sheet.createRow(0);
+        for (int i = 0; i < headers.length; i++) {
+            Cell cell = headerRow.createCell(i);
+            cell.setCellValue(headers[i]);
+            cell.setCellStyle(headerStyle);
+        }
+
+        // Add data rows
+        int rowNum = 1;
+        for (QueryDTO query : queries) {
+            Row row = sheet.createRow(rowNum);
+            rowWriter.writeRow(row, query, rowNum);
+            rowNum++;
+        }
+
+        // Auto-size columns
+        for (int i = 0; i < headers.length; i++) {
+            sheet.autoSizeColumn(i);
         }
     }
 
@@ -172,8 +241,6 @@ public class ExcelService {
         try (Workbook workbook = new XSSFWorkbook();
              FileOutputStream fileOut = new FileOutputStream(filePath.toFile())) {
 
-            Sheet sheet = workbook.createSheet("Impacted Queries");
-
             // Create header style
             CellStyle headerStyle = workbook.createCellStyle();
             Font headerFont = workbook.createFont();
@@ -182,32 +249,135 @@ public class ExcelService {
             headerStyle.setFillForegroundColor(IndexedColors.GREY_25_PERCENT.getIndex());
             headerStyle.setFillPattern(FillPatternType.SOLID_FOREGROUND);
 
-            // Create header row
-            Row headerRow = sheet.createRow(0);
-            String[] headers = {"Query Name", "Query Description", "Actual Query", "Updated Query"};
-            for (int i = 0; i < headers.length; i++) {
-                Cell cell = headerRow.createCell(i);
-                cell.setCellValue(headers[i]);
-                cell.setCellStyle(headerStyle);
-            }
+            // Sheet 1: Query List
+            Sheet queryListSheet = workbook.createSheet("Query List");
+            String[] queryListHeaders = {"Query Name", "Query Description", "Original Query"};
+            createSheetWithData(queryListSheet, headerStyle, queryListHeaders, impactedQueries, 
+                (row, query, rowNum) -> {
+                    row.createCell(0).setCellValue(query.getQueryName());
+                    row.createCell(1).setCellValue(query.getDescription());
+                    row.createCell(2).setCellValue(query.getOriginalQuery());
+                });
 
-            // Add data rows
-            int rowNum = 1;
-            for (QueryDTO query : impactedQueries) {
-                Row row = sheet.createRow(rowNum++);
+            // Sheet 2: Migration Results
+            Sheet migrationSheet = workbook.createSheet("Migration Results");
+            String[] migrationHeaders = {"Query Name", "Query Description", "Original Query", "Updated Query"};
+            createSheetWithData(migrationSheet, headerStyle, migrationHeaders, impactedQueries,
+                (row, query, rowNum) -> {
+                    row.createCell(0).setCellValue(query.getQueryName());
+                    row.createCell(1).setCellValue(query.getDescription());
+                    row.createCell(2).setCellValue(query.getOriginalQuery());
+                    row.createCell(3).setCellValue(query.getUpdatedQuery());
+                });
+
+            // Sheet 3: Zuora Update Results
+            Sheet zuoraSheet = workbook.createSheet("Zuora Update Results");
+            String[] zuoraHeaders = {"Query Name", "Query Description", "Original Query", "Updated Query", "Old URL", "New URL", "Status"};
+            createSheetWithData(zuoraSheet, headerStyle, zuoraHeaders, impactedQueries,
+                (row, query, rowNum) -> {
+                    row.createCell(0).setCellValue(query.getQueryName());
+                    row.createCell(1).setCellValue(query.getDescription());
+                    row.createCell(2).setCellValue(query.getOriginalQuery());
+                    row.createCell(3).setCellValue(query.getUpdatedQuery());
+                    row.createCell(4).setCellValue(query.getOldUrl() != null ? query.getOldUrl() : "");
+                    row.createCell(5).setCellValue(query.getNewUrl() != null ? query.getNewUrl() : "");
+                    row.createCell(6).setCellValue(query.getStatus() != null ? query.getStatus() : "");
+                });
+
+            workbook.write(fileOut);
+            log.info("Saved report with {} queries across 3 sheets to: {}", 
+                impactedQueries.size(), filePath.toAbsolutePath());
+            return filePath.toString();
+        }
+    }
+
+    public String saveExtractedQueries(List<QueryDTO> queries) throws IOException {
+        String fileName = "extracted_queries.xlsx";
+        Path filePath = Paths.get(REPORTS_DIR, fileName);
+
+        try (Workbook workbook = new XSSFWorkbook();
+             FileOutputStream fileOut = new FileOutputStream(filePath.toFile())) {
+
+            CellStyle headerStyle = workbook.createCellStyle();
+            Font headerFont = workbook.createFont();
+            headerFont.setBold(true);
+            headerStyle.setFont(headerFont);
+            headerStyle.setFillForegroundColor(IndexedColors.GREY_25_PERCENT.getIndex());
+            headerStyle.setFillPattern(FillPatternType.SOLID_FOREGROUND);
+
+            Sheet sheet = workbook.createSheet("Extracted Queries");
+            String[] headers = {"queryName", "description", "query"};
+            createSheetWithData(sheet, headerStyle, headers, queries, (row, query, rowNum) -> {
+                row.createCell(0).setCellValue(query.getQueryName());
+                row.createCell(1).setCellValue(query.getDescription());
+                // Use originalQuery as the 'query' field if present
+                String sql = query.getOriginalQuery() != null ? query.getOriginalQuery() : "";
+                row.createCell(2).setCellValue(sql);
+            });
+
+            workbook.write(fileOut);
+            log.info("Saved extracted queries report to: {}", filePath.toAbsolutePath());
+            return filePath.toString();
+        }
+    }
+
+    public String saveImpactedSimple(List<QueryDTO> impactedQueries) throws IOException {
+        String fileName = "impacted_queries.xlsx";
+        Path filePath = Paths.get(REPORTS_DIR, fileName);
+
+        try (Workbook workbook = new XSSFWorkbook();
+             FileOutputStream fileOut = new FileOutputStream(filePath.toFile())) {
+
+            CellStyle headerStyle = workbook.createCellStyle();
+            Font headerFont = workbook.createFont();
+            headerFont.setBold(true);
+            headerStyle.setFont(headerFont);
+            headerStyle.setFillForegroundColor(IndexedColors.GREY_25_PERCENT.getIndex());
+            headerStyle.setFillPattern(FillPatternType.SOLID_FOREGROUND);
+
+            Sheet sheet = workbook.createSheet("Impacted Queries");
+            String[] headers = {"queryName", "description", "originalQuery", "updatedQuery"};
+            createSheetWithData(sheet, headerStyle, headers, impactedQueries, (row, query, rowNum) -> {
                 row.createCell(0).setCellValue(query.getQueryName());
                 row.createCell(1).setCellValue(query.getDescription());
                 row.createCell(2).setCellValue(query.getOriginalQuery());
                 row.createCell(3).setCellValue(query.getUpdatedQuery());
-            }
-
-            // Auto-size columns
-            for (int i = 0; i < headers.length; i++) {
-                sheet.autoSizeColumn(i);
-            }
+            });
 
             workbook.write(fileOut);
-            log.info("Saved report to: {}", filePath.toAbsolutePath());
+            log.info("Saved impacted queries report to: {}", filePath.toAbsolutePath());
+            return filePath.toString();
+        }
+    }
+
+    public String saveUpdateReport(List<QueryDTO> queries) throws IOException {
+        String fileName = "Update_queries.xlsx";
+        Path filePath = Paths.get(REPORTS_DIR, fileName);
+
+        try (Workbook workbook = new XSSFWorkbook();
+             FileOutputStream fileOut = new FileOutputStream(filePath.toFile())) {
+
+            CellStyle headerStyle = workbook.createCellStyle();
+            Font headerFont = workbook.createFont();
+            headerFont.setBold(true);
+            headerStyle.setFont(headerFont);
+            headerStyle.setFillForegroundColor(IndexedColors.GREY_25_PERCENT.getIndex());
+            headerStyle.setFillPattern(FillPatternType.SOLID_FOREGROUND);
+
+            Sheet sheet = workbook.createSheet("Zuora Update Results");
+            String[] headers = {"queryName", "description", "originalQuery", "updatedQuery", "oldUrl", "newUrl", "status"};
+            createSheetWithData(sheet, headerStyle, headers, queries, (row, query, rowNum) -> {
+                row.createCell(0).setCellValue(query.getQueryName());
+                row.createCell(1).setCellValue(query.getDescription());
+                row.createCell(2).setCellValue(query.getOriginalQuery());
+                row.createCell(3).setCellValue(query.getUpdatedQuery());
+                row.createCell(4).setCellValue(query.getOldUrl() != null ? query.getOldUrl() : "");
+                row.createCell(5).setCellValue(query.getNewUrl() != null ? query.getNewUrl() : "");
+                row.createCell(6).setCellValue(query.getStatus() != null ? query.getStatus() : "");
+            });
+
+            workbook.write(fileOut);
+            log.info("Saved update queries report to: {}", filePath.toAbsolutePath());
             return filePath.toString();
         }
     }
@@ -217,17 +387,35 @@ public class ExcelService {
             return "";
         }
 
-        switch (cell.getCellType()) {
-            case STRING:
-                return cell.getStringCellValue();
-            case NUMERIC:
-                return String.valueOf(cell.getNumericCellValue());
-            case BOOLEAN:
-                return String.valueOf(cell.getBooleanCellValue());
-            case FORMULA:
-                return cell.getCellFormula();
-            default:
-                return "";
+        try {
+            switch (cell.getCellType()) {
+                case STRING:
+                    return cell.getStringCellValue() != null ? cell.getStringCellValue().trim() : "";
+                case NUMERIC:
+                    if (DateUtil.isCellDateFormatted(cell)) {
+                        return cell.getDateCellValue().toString();
+                    }
+                    return String.valueOf(cell.getNumericCellValue());
+                case BOOLEAN:
+                    return String.valueOf(cell.getBooleanCellValue());
+                case FORMULA:
+                    try {
+                        return cell.getStringCellValue().trim();
+                    } catch (Exception e) {
+                        try {
+                            return String.valueOf(cell.getNumericCellValue());
+                        } catch (Exception ex) {
+                            return cell.getCellFormula();
+                        }
+                    }
+                case BLANK:
+                    return "";
+                default:
+                    return "";
+            }
+        } catch (Exception e) {
+            log.warn("Error reading cell value", e);
+            return "";
         }
     }
 }
